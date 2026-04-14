@@ -1,0 +1,11 @@
+[package]
+name = "paraflate-io"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+paraflate-core = { path = "../paraflate-core" }
+paraflate-buffers = { path = "../paraflate-buffers" }
+memmap2.workspace = true

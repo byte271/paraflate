@@ -1,0 +1,27 @@
+Paraflate evaluation harness
+total_input_files: 55
+total_corpus_bytes: 2780541
+workload_count: 15
+archives_built: 150
+modes_tested: 10
+verification_pass_rate: 1.0000
+average_compression_ratio_paraflate: 0.771291
+best_ratio: 0.007827 (wl_12_duplicate_heavy)
+best_throughput_mb_s: 5.882 (wl_10_binary_like)
+failed_cases: 0
+comparisons (winner by ratio = smallest)
+  wl_01_very_small_text ratio_winner=flate2 paraflate=6.75000 flate2=1.50000 zip_ref=55.50000
+  wl_02_medium_text ratio_winner=paraflate paraflate=0.13860 flate2=0.14041 zip_ref=0.14572
+  wl_03_large_text ratio_winner=flate2 paraflate=0.05979 flate2=0.05929 zip_ref=0.05951
+  wl_04_highly_repetitive ratio_winner=flate2 paraflate=0.01453 flate2=0.00105 zip_ref=0.00169
+  wl_05_mixed_text_numbers ratio_winner=paraflate paraflate=0.20491 flate2=0.20599 zip_ref=0.20738
+  wl_06_json_like ratio_winner=paraflate paraflate=0.07776 flate2=0.07776 zip_ref=0.08737
+  wl_07_csv_like ratio_winner=paraflate paraflate=0.36929 flate2=0.37390 zip_ref=0.37698
+  wl_08_log_like ratio_winner=flate2 paraflate=0.17809 flate2=0.15268 zip_ref=0.15363
+  wl_09_source_like ratio_winner=flate2 paraflate=0.02072 flate2=0.02050 zip_ref=0.02226
+  wl_10_binary_like ratio_winner=flate2 paraflate=0.01346 flate2=0.01326 zip_ref=0.01401
+  wl_11_random_entropy ratio_winner=paraflate paraflate=1.00000 flate2=1.00017 zip_ref=1.00079
+  wl_12_duplicate_heavy ratio_winner=flate2 paraflate=0.00783 flate2=0.00246 zip_ref=0.00256
+  wl_13_near_duplicate ratio_winner=flate2 paraflate=0.01303 flate2=0.00374 zip_ref=0.00681
+  wl_14_nested_many_small ratio_winner=flate2 paraflate=1.07487 flate2=0.14439 zip_ref=4.75615
+  wl_16_mixed_combined ratio_winner=reference_zip paraflate=0.33514 flate2=0.33632 zip_ref=0.33202

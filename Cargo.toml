@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/paraflate-core",
+    "crates/paraflate-buffers",
+    "crates/paraflate-io",
+    "crates/paraflate-verify",
+    "crates/paraflate-index",
+    "crates/paraflate-lz77",
+    "crates/paraflate-dictionary",
+    "crates/paraflate-deflate",
+    "crates/paraflate-zip",
+    "crates/paraflate-scheduler",
+    "crates/paraflate-pipeline",
+    "crates/paraflate-cli",
+    "crates/paraflate-bench",
+    "crates/paraflate-tests",
+    "crates/paraflate-harness",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crc32fast = "1.4"
+itertools = "0.13"
+memmap2 = "0.9"
+parking_lot = "0.12"
+clap = { version = "4.5", features = ["derive"] }
+criterion = "0.5"
+tempfile = "3.10"
+

@@ -1,0 +1,17 @@
+[package]
+name = "paraflate-pipeline"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+paraflate-core = { path = "../paraflate-core" }
+paraflate-io = { path = "../paraflate-io" }
+paraflate-index = { path = "../paraflate-index" }
+paraflate-dictionary = { path = "../paraflate-dictionary" }
+paraflate-deflate = { path = "../paraflate-deflate" }
+paraflate-zip = { path = "../paraflate-zip" }
+paraflate-scheduler = { path = "../paraflate-scheduler" }
+paraflate-verify = { path = "../paraflate-verify" }
