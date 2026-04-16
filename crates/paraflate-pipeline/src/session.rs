@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -6,13 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use paraflate_core::{
-    ArchiveEntryDescriptor, ArchiveLayout, ArchiveProfile, DeflateBlockDebugRecord, EntryId,
-    EntryRunStats, ExecutionPhase, ParaflateError, ParaflateResult, VerificationMode,
+    ArchiveEntryDescriptor, ArchiveLayout, ArchiveProfile, CompressionMethod,
+    DeflateBlockDebugRecord, EntryId, EntryRunStats, ExecutionPhase, ParaflateError,
+    ParaflateResult, VerificationMode,
 };
 use paraflate_deflate::{BlockPlanner, DeflateEngine, DeflateEngineConfig, EntryCompressHints};
-use paraflate_dictionary::{GlobalAnalyzer, SamplePlan};
+use paraflate_dictionary::{GlobalAnalyzer, GlobalModel, SamplePlan};
 use paraflate_index::{IndexBuildConfig, PatternIndex};
-use paraflate_io::{DirectoryScanner, FileReadPlan, FileReader};
+use paraflate_io::{DirectoryScanner, FileReadPlan, FileReader, ReadOutcome};
 use paraflate_scheduler::{TaskGraphBuilder, WorkerPool, WorkerPoolConfig};
 use paraflate_zip::{LocalHeaderSpec, ZipWriter};
 
@@ -84,11 +84,8 @@ impl ArchiveSession {
         } else {
             None
         };
-        let mut entry_stats_acc = if params.collect_entry_stats {
-            Some(Vec::<EntryRunStats>::new())
-        } else {
-            None
-        };
+
+        // ── Discovery ────────────────────────────────────────────────────────
         let scanner = DirectoryScanner::new(&params.input_root);
         let scan = scanner.scan()?;
         if scan.entries.is_empty() {
@@ -103,26 +100,39 @@ impl ArchiveSession {
         }
         let mut entries = scan.entries;
         Self::apply_layout(&mut entries, profile);
+
+        // ── Sampling + global analysis ────────────────────────────────────────
+        // Fast path: for very small archives, skip sampling and use defaults.
+        // The analysis overhead dominates for tiny workloads.
+        let total_bytes = report.uncompressed_bytes;
         report.phase = ExecutionPhase::Sampling;
-        let plan = SamplePlan::from_policy(&profile.execution);
-        let samples = Self::collect_samples(&entries, profile, &plan)?;
-        report.phase = ExecutionPhase::GlobalAnalysis;
-        let model = GlobalAnalyzer::analyze(&entries, &samples, &profile.execution, &plan);
+        let model = if total_bytes < 64 * 1024 {
+            // Skip sampling entirely for small archives.
+            GlobalModel::default()
+        } else {
+            let plan = SamplePlan::from_policy(&profile.execution);
+            let samples = Self::collect_samples(&entries, profile, &plan)?;
+            report.phase = ExecutionPhase::GlobalAnalysis;
+            GlobalAnalyzer::analyze(&entries, &samples, &profile.execution, &plan)
+        };
+
         let graph = TaskGraphBuilder::new()
             .linear_pipeline(&entries.iter().map(|e| e.id).collect::<Vec<_>>());
         let _ = graph;
-        report.phase = ExecutionPhase::BlockScheduling;
-        let pool_cfg = WorkerPoolConfig {
-            worker_threads: profile.budget.worker_threads,
-            queue_depth: profile.budget.max_pending_tasks,
-        };
-        let pool = WorkerPool::new(pool_cfg);
+
+        // ── File read ─────────────────────────────────────────────────────────
         report.phase = ExecutionPhase::FileRead;
+        let reader = FileReader::new(FileReadPlan {
+            prefer_mmap_bytes: 4 * 1024 * 1024,
+            chunk_bytes: profile.budget.memory.read_chunk_bytes,
+        });
         let mut blobs: Vec<Option<Arc<Vec<u8>>>> = vec![None; entries.len()];
         for e in &entries {
-            let v = read_file_bytes(&e.path)?;
+            let v = read_file_bytes_fast(&e.path, &reader)?;
             blobs[e.id.0 as usize] = Some(Arc::new(v));
         }
+
+        // ── Predictive planning ───────────────────────────────────────────────
         let pred_plan = build_predictive_archive_plan(
             &entries,
             &blobs,
@@ -131,141 +141,209 @@ impl ArchiveSession {
             &profile.predictive,
             profile.compression.method,
         );
+
+        // ── Chunk planning ────────────────────────────────────────────────────
         report.phase = ExecutionPhase::ChunkPlanning;
-        let mut plans = BTreeMap::new();
-        for e in &entries {
-            let data_ref = blobs[e.id.0 as usize]
-                .as_ref()
-                .ok_or_else(|| ParaflateError::InvariantViolated("blob".to_string()))?;
-            let tb = pred_plan.for_entry(e.id).map(|p| p.target_block_bytes);
-            let p = BlockPlanner::plan_entry_with_data_predictive(
-                e.id,
-                Some(data_ref.as_slice()),
-                e.uncompressed_size,
-                &profile.execution,
-                &model,
-                tb,
-            );
-            plans.insert(e.id.0, p);
+        struct EntryJob {
+            entry: ArchiveEntryDescriptor,
+            data: Arc<Vec<u8>>,
+            hints: EntryCompressHints,
+            chunk_plan: paraflate_core::ChunkPlan,
         }
-        report.phase = ExecutionPhase::GlobalAnalysis;
-        let mut idx_pairs: Vec<(u32, &[u8])> = Vec::new();
-        for e in &entries {
-            let b = blobs[e.id.0 as usize]
-                .as_ref()
-                .ok_or_else(|| ParaflateError::InvariantViolated("blob".to_string()))?;
-            idx_pairs.push((e.id.0, b.as_slice()));
-        }
-        let index = Arc::new(PatternIndex::build(
-            &idx_pairs,
-            &IndexBuildConfig {
-                stride: model.index_stride.max(1),
-                ..IndexBuildConfig::default()
-            },
-        ));
-        report.phase = ExecutionPhase::Compression;
-        let engine_cfg = DeflateEngineConfig {
-            profile: profile.compression.clone(),
-        };
-        let engine = DeflateEngine::new(engine_cfg);
-        let mut ordered: Vec<(u32, DeflateOutput)> = Vec::new();
+
+        let mut entry_methods: Vec<CompressionMethod> = vec![profile.compression.method; entries.len()];
+        let mut jobs: Vec<EntryJob> = Vec::with_capacity(entries.len());
         for e in &entries {
             let data = blobs[e.id.0 as usize]
                 .as_ref()
                 .ok_or_else(|| ParaflateError::InvariantViolated("blob".to_string()))?
                 .clone();
-            let chunk_plan = plans
-                .get(&e.id.0)
-                .ok_or_else(|| ParaflateError::EntryNotFound(e.logical_name.clone()))?;
             let ep = pred_plan.for_entry(e.id);
             let hints = build_entry_compress_hints(profile, ep, &model);
-            let mut out = engine.compress_entry(
-                &pool,
-                e,
-                data.clone(),
-                chunk_plan,
-                &model,
-                Arc::clone(&index),
-                Some(&hints),
+            entry_methods[e.id.0 as usize] = hints.profile.method;
+            let chunk_plan = BlockPlanner::plan_entry_with_data_predictive(
+                e.id,
+                Some(data.as_slice()),
+                e.uncompressed_size,
                 &profile.execution,
-                debug_arc.clone(),
+                &model,
+                ep.map(|plan| plan.target_block_bytes),
             );
-            if let Err(ref err) = out {
-                if should_retry_compression(err) {
-                    let fixed_profile = merge_profile_fixed_deflate(&hints.profile);
-                    let h1 = EntryCompressHints {
-                        profile: fixed_profile,
-                        lz77_max_chain: None,
-                        lz77_nice_match: None,
-                        predicted_size_ratio: hints.predicted_size_ratio,
-                    };
-                    out = engine.compress_entry(
-                        &pool,
-                        e,
-                        data.clone(),
-                        chunk_plan,
-                        &model,
-                        Arc::clone(&index),
-                        Some(&h1),
-                        &profile.execution,
-                        debug_arc.clone(),
-                    );
-                }
-            }
-            if let Err(ref err) = out {
-                if should_retry_compression(err) {
-                    let stored_profile = merge_profile_stored(&hints.profile);
-                    let h2 = EntryCompressHints {
-                        profile: stored_profile,
-                        lz77_max_chain: None,
-                        lz77_nice_match: None,
-                        predicted_size_ratio: hints.predicted_size_ratio,
-                    };
-                    out = engine.compress_entry(
-                        &pool,
-                        e,
-                        data,
-                        chunk_plan,
-                        &model,
-                        Arc::clone(&index),
-                        Some(&h2),
-                        &profile.execution,
-                        debug_arc.clone(),
-                    );
-                }
-            }
-            let out = out?;
-            if let Some(ref mut es) = entry_stats_acc {
-                let stored_eff = out.compressed.len() as u64 == e.uncompressed_size;
-                es.push(EntryRunStats {
-                    entry_id: e.id.0,
-                    uncompressed_size: e.uncompressed_size,
-                    compressed_size: out.compressed.len() as u64,
-                    stored_effective: stored_eff,
-                });
-            }
-            ordered.push((e.id.0, out));
+            jobs.push(EntryJob {
+                entry: e.clone(),
+                data,
+                hints,
+                chunk_plan,
+            });
         }
-        ordered.sort_by_key(|(k, _)| *k);
+
+        // ── Pattern index ─────────────────────────────────────────────────────
+        report.phase = ExecutionPhase::GlobalAnalysis;
+        // Skip the index when there is little cross-entry duplication.
+        let dup_ratio = model.summary.duplicate_mass as f64
+            / model.summary.total_uncompressed.max(1) as f64;
+        let use_index = dup_ratio > 0.04 || entries.len() <= 4;
+        let index = if use_index {
+            let mut idx_pairs: Vec<(u32, &[u8])> = Vec::with_capacity(entries.len());
+            for e in &entries {
+                let b = blobs[e.id.0 as usize]
+                    .as_ref()
+                    .ok_or_else(|| ParaflateError::InvariantViolated("blob".to_string()))?;
+                idx_pairs.push((e.id.0, b.as_slice()));
+            }
+            Arc::new(PatternIndex::build(
+                &idx_pairs,
+                &IndexBuildConfig {
+                    stride: model.index_stride.max(1),
+                    ..IndexBuildConfig::default()
+                },
+            ))
+        } else {
+            Arc::new(PatternIndex::empty())
+        };
+
+        // ── Parallel compression ──────────────────────────────────────────────
+        // All entries are dispatched to a single persistent worker pool.
+        // Workers are spawned once and reused — no per-entry thread overhead.
+        report.phase = ExecutionPhase::Compression;
+
+        let engine_cfg = DeflateEngineConfig {
+            profile: profile.compression.clone(),
+        };
+        let engine = Arc::new(DeflateEngine::new(engine_cfg));
+
+        let threads = profile.budget.worker_threads.max(1);
+
+        // One persistent pool for the whole session.
+        let shared_pool = Arc::new(WorkerPool::new(WorkerPoolConfig {
+            worker_threads: threads,
+            queue_depth: threads.saturating_mul(16).max(128),
+        }));
+
+        let model_arc = Arc::new(model.clone());
+        let index_arc = Arc::clone(&index);
+        let profile_arc = Arc::new(profile.clone());
+        let debug_arc2 = debug_arc.clone();
+        let collect_stats = params.collect_entry_stats;
+
+        type JobResult = (DeflateOutput, Option<EntryRunStats>);
+
+        // Build one closure per entry.
+        let mut entry_closures: Vec<
+            Box<dyn FnOnce() -> ParaflateResult<JobResult> + Send + 'static>,
+        > = Vec::with_capacity(jobs.len());
+
+        for job in jobs {
+            let engine_c = Arc::clone(&engine);
+            let model_c = Arc::clone(&model_arc);
+            let index_c = Arc::clone(&index_arc);
+            let profile_c = Arc::clone(&profile_arc);
+            let debug_c = debug_arc2.clone();
+            let pool_c = Arc::clone(&shared_pool);
+            let entry_id = job.entry.id.0;
+
+            entry_closures.push(Box::new(move || {
+                let mut out = engine_c.compress_entry(
+                    &pool_c,
+                    &job.entry,
+                    job.data.clone(),
+                    &job.chunk_plan,
+                    &model_c,
+                    Arc::clone(&index_c),
+                    Some(&job.hints),
+                    &profile_c.execution,
+                    debug_c.clone(),
+                );
+
+                if let Err(ref err) = out {
+                    if should_retry_compression(err) {
+                        let fixed_profile = merge_profile_fixed_deflate(&job.hints.profile);
+                        let h1 = EntryCompressHints {
+                            profile: fixed_profile,
+                            lz77_max_chain: None,
+                            lz77_nice_match: None,
+                            predicted_size_ratio: job.hints.predicted_size_ratio,
+                        };
+                        out = engine_c.compress_entry(
+                            &pool_c,
+                            &job.entry,
+                            job.data.clone(),
+                            &job.chunk_plan,
+                            &model_c,
+                            Arc::clone(&index_c),
+                            Some(&h1),
+                            &profile_c.execution,
+                            debug_c.clone(),
+                        );
+                    }
+                }
+                if let Err(ref err) = out {
+                    if should_retry_compression(err) {
+                        let stored_profile = merge_profile_stored(&job.hints.profile);
+                        let h2 = EntryCompressHints {
+                            profile: stored_profile,
+                            lz77_max_chain: None,
+                            lz77_nice_match: None,
+                            predicted_size_ratio: job.hints.predicted_size_ratio,
+                        };
+                        out = engine_c.compress_entry(
+                            &pool_c,
+                            &job.entry,
+                            job.data,
+                            &job.chunk_plan,
+                            &model_c,
+                            Arc::clone(&index_c),
+                            Some(&h2),
+                            &profile_c.execution,
+                            debug_c,
+                        );
+                    }
+                }
+
+                out.map(|o| {
+                    let stats = if collect_stats {
+                        let stored_eff =
+                            o.compressed.len() as u64 == job.entry.uncompressed_size;
+                        Some(EntryRunStats {
+                            entry_id,
+                            uncompressed_size: job.entry.uncompressed_size,
+                            compressed_size: o.compressed.len() as u64,
+                            stored_effective: stored_eff,
+                        })
+                    } else {
+                        None
+                    };
+                    (o, stats)
+                })
+            }));
+        }
+
+        // Dispatch all entry closures to the persistent pool.
+        let results = shared_pool.run_parallel(entry_closures)?;
+
+        let mut ordered: Vec<DeflateOutput> = Vec::with_capacity(entries.len());
+        let mut entry_stats_acc: Option<Vec<EntryRunStats>> =
+            if params.collect_entry_stats { Some(Vec::new()) } else { None };
+
+        for (out, stats) in results {
+            if let (Some(ref mut acc), Some(s)) = (&mut entry_stats_acc, stats) {
+                acc.push(s);
+            }
+            ordered.push(out);
+        }
+
+        // ── ZIP writing ───────────────────────────────────────────────────────
         report.phase = ExecutionPhase::Encoding;
         report.phase = ExecutionPhase::ZipWriting;
         let file = File::create(&params.output_zip)?;
         let mut zip = ZipWriter::new(file);
-        for e in &entries {
-            let out = ordered
-                .iter()
-                .find(|(id, _)| *id == e.id.0)
-                .map(|(_, v)| v)
-                .ok_or_else(|| ParaflateError::EntryNotFound(e.logical_name.clone()))?;
+        for (e, out) in entries.iter().zip(ordered.iter()) {
             report.compressed_bytes = report
                 .compressed_bytes
                 .saturating_add(out.compressed.len() as u64);
-            let ep = pred_plan.for_entry(e.id);
-            let hints = build_entry_compress_hints(profile, ep, &model);
-            let method = hints.profile.method;
             let spec = LocalHeaderSpec {
                 name: e.logical_name.clone(),
-                method,
+                method: entry_methods[e.id.0 as usize],
                 crc32: out.crc32,
                 compressed_size: out.compressed.len() as u32,
                 uncompressed_size: out.uncompressed_size as u32,
@@ -274,14 +352,18 @@ impl ArchiveSession {
             };
             zip.write_local_entry(spec, &out.compressed)?;
         }
+
+        // ── Finalization ──────────────────────────────────────────────────────
         report.phase = ExecutionPhase::Finalization;
         let (sink, summary) = zip.finalize()?;
         sink.sync_all()?;
         report.zip = Some(summary);
+
         if profile.predictive.verification != VerificationMode::Off {
             let vr = verify_zip_path(&params.output_zip, profile.predictive.verification)?;
             report.verification = Some(vr);
         }
+
         report.elapsed_ms = t0.elapsed().as_millis();
         if let Some(a) = debug_arc {
             if let Ok(g) = a.lock() {
@@ -339,9 +421,12 @@ impl ArchiveSession {
     }
 }
 
-fn read_file_bytes(path: &PathBuf) -> ParaflateResult<Vec<u8>> {
-    let mut f = File::open(path)?;
-    let mut v = Vec::new();
-    f.read_to_end(&mut v)?;
-    Ok(v)
+/// Read a file into memory. Uses mmap for files ≥ 4 MiB to avoid the
+/// kernel-copy overhead of `read_to_end`.
+fn read_file_bytes_fast(path: &PathBuf, reader: &FileReader) -> ParaflateResult<Vec<u8>> {
+    match reader.read_path_mmap(path)? {
+        ReadOutcome::Mmap(m) => Ok(m.to_vec()),
+        ReadOutcome::Inline(v) => Ok(v),
+        ReadOutcome::Buffer(b) => Ok(b.as_slice().to_vec()),
+    }
 }

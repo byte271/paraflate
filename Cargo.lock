@@ -690,6 +690,7 @@ dependencies = [
 name = "paraflate-lz77"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "paraflate-index",
 ]
 
@@ -698,6 +699,7 @@ name = "paraflate-pipeline"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "crossbeam-channel",
  "paraflate-core",
  "paraflate-deflate",
  "paraflate-dictionary",
@@ -714,6 +716,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "paraflate-core",
+ "parking_lot",
 ]
 
 [[package]]

@@ -35,7 +35,10 @@ pub fn encode_deflate_blocks(
             "token stream too large".to_string(),
         ));
     }
-    let mut w = BitWriter::new();
+    // Estimate output size: ~0.7× input for typical compression.
+    // This reduces reallocation overhead during encoding.
+    let est_size = (total_tokens * 7 / 10).max(4096);
+    let mut w = BitWriter::with_capacity(est_size);
     match strategy {
         DeflateStrategy::Fixed => {
             let mut merged = Vec::with_capacity(total_tokens);
@@ -80,7 +83,8 @@ pub fn encode_one_deflate_block(
             "token stream too large".to_string(),
         ));
     }
-    let mut w = BitWriter::new();
+    let est_size = (tokens.len() * 7 / 10).max(1024);
+    let mut w = BitWriter::with_capacity(est_size);
     match strategy {
         DeflateStrategy::Fixed => encode_fixed_block(&mut w, tokens, bfinal),
         _ => encode_dynamic_block_fresh(&mut w, tokens, bfinal).map_err(pm_err)?,

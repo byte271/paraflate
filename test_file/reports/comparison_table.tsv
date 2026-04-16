@@ -1,0 +1,16 @@
+workload	paraflate_ratio	flate2_ratio	naive_ratio	ref_zip_ratio	ratio_winner	paraflate_mb_s	flate2_mb_s	speed_winner
+wl_01_very_small_text	1.000000	1.500000	1.500000	55.500000	paraflate	0.002	0.004	reference_zip
+wl_02_medium_text	0.134955	0.140405	0.141396	0.145721	paraflate	7.057	21.172	reference_zip
+wl_03_large_text	0.059918	0.059290	0.079446	0.059505	flate2	7.336	171.181	naive
+wl_04_highly_repetitive	0.017710	0.001055	0.004680	0.001685	flate2	5.780	190.735	reference_zip
+wl_05_mixed_text_numbers	0.205773	0.205990	0.263412	0.207384	paraflate	4.668	26.451	naive
+wl_06_json_like	0.077523	0.077759	0.079414	0.087371	paraflate	12.105	12.105	reference_zip
+wl_07_csv_like	0.355189	0.373896	0.405428	0.376982	paraflate	3.258	35.839	reference_zip
+wl_08_log_like	0.199579	0.152683	0.209470	0.153626	flate2	4.532	113.292	naive
+wl_09_source_like	0.020671	0.020504	0.023387	0.022264	flate2	5.236	62.838	reference_zip
+wl_10_binary_like	0.013463	0.013256	0.017659	0.014008	flate2	5.882	147.057	reference_zip
+wl_11_random_entropy	1.000000	1.000167	1.000939	1.000789	paraflate	5.364	42.915	naive
+wl_12_duplicate_heavy	0.011630	0.002459	0.006088	0.002556	flate2	1.185	549.316	naive
+wl_13_near_duplicate	0.016572	0.003735	0.008381	0.006809	flate2	6.723	80.681	reference_zip
+wl_14_nested_many_small	1.000000	0.144385	0.176471	4.756150	flate2	0.089	0.892	naive
+wl_16_mixed_combined	0.338956	0.336324	0.346090	0.332023	reference_zip	5.388	123.926	naive

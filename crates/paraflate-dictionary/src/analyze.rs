@@ -23,8 +23,8 @@ impl Default for GlobalModel {
             summary: GlobalStatisticsSummary::default(),
             suggested_block_bytes: 256 * 1024,
             suggested_order: Vec::new(),
-            lz77_max_chain: 256,
-            lz77_nice_match: 258,
+            lz77_max_chain: 128,
+            lz77_nice_match: 128,
             index_stride: 1,
         }
     }
@@ -80,14 +80,14 @@ impl GlobalAnalyzer {
         let suggested_block_bytes = Self::block_size(&summary, policy, plan, entries.len().max(1));
         let suggested_order = Self::order(entries, &summary);
         let lz77_max_chain = if summary.duplicate_mass > summary.text_mass {
-            384u32
+            128u32
         } else {
-            192u32
+            64u32
         };
         let lz77_nice_match = if summary.mean_entry_bytes > (1024 * 1024) {
-            258u32
+            128u32
         } else {
-            96u32
+            64u32
         };
         let index_stride = if summary.duplicate_mass > summary.text_mass {
             1usize

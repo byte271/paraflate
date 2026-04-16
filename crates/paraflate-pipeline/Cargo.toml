@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 crc32fast.workspace = true
+crossbeam-channel.workspace = true
 paraflate-core = { path = "../paraflate-core" }
 paraflate-io = { path = "../paraflate-io" }
 paraflate-index = { path = "../paraflate-index" }

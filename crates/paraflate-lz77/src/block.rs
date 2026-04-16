@@ -4,7 +4,10 @@ use crate::hash::roll_hash3;
 use crate::Window;
 
 const NIL: u32 = u32::MAX;
-const HASH_MASK: usize = 0x7FFF;
+/// 15-bit hash table — 32 768 slots, same as zlib's default.
+const HASH_BITS: usize = 15;
+const HASH_SIZE: usize = 1 << HASH_BITS;
+const HASH_MASK: usize = HASH_SIZE - 1;
 
 #[derive(Clone, Debug)]
 pub struct Lz77Config {
@@ -15,8 +18,8 @@ pub struct Lz77Config {
 impl Default for Lz77Config {
     fn default() -> Self {
         Self {
-            max_chain: 256,
-            nice_match: 258,
+            max_chain: 128,
+            nice_match: 128,
         }
     }
 }
@@ -48,50 +51,48 @@ pub struct Lz77CompressOutput {
     pub matches_from_index: u32,
 }
 
-#[inline]
+#[inline(always)]
 fn match_score(len: usize, dist: usize) -> u64 {
     (len as u64)
         .saturating_mul(65536)
         .saturating_sub(dist as u64)
 }
 
-fn pick_match(
-    index_match: Option<(usize, usize)>,
-    window_match: Option<(usize, usize)>,
-) -> Option<(usize, usize, MatchKind)> {
-    match (index_match, window_match) {
-        (None, None) => None,
-        (None, Some((l, d))) => Some((l, d, MatchKind::Window)),
-        (Some((l, d)), None) => Some((l, d, MatchKind::Index)),
-        (Some((li, di)), Some((lw, dw))) => {
-            let si = match_score(li, di);
-            let sw = match_score(lw, dw);
-            if si > sw || si == sw {
-                Some((li, di, MatchKind::Index))
-            } else {
-                Some((lw, dw, MatchKind::Window))
-            }
+/// Extend a match starting at `(mp, pos)` as far as possible.
+/// Uses 8-byte QWORD comparison for the bulk of the match.
+#[inline(always)]
+fn extend_match(buf: &[u8], mp: usize, pos: usize) -> usize {
+    let max_len = 258usize.min(buf.len() - pos).min(pos - mp);
+    let mut len = 0usize;
+    while len + 8 <= max_len {
+        // SAFETY: bounds checked above.
+        let a = u64::from_le_bytes(buf[mp + len..mp + len + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(buf[pos + len..pos + len + 8].try_into().unwrap());
+        let diff = a ^ b;
+        if diff != 0 {
+            len += (diff.trailing_zeros() / 8) as usize;
+            return len;
         }
+        len += 8;
     }
+    while len < max_len && buf[mp + len] == buf[pos + len] {
+        len += 1;
+    }
+    len
 }
 
-fn best_at(
+/// Find the best match at `pos` using the hash-chain window.
+#[inline]
+fn window_best(
     buf: &[u8],
     pos: usize,
     head: &[u32],
     prev: &[u32],
     cfg: &Lz77Config,
-    index: Option<&PatternIndex>,
-    entry: u32,
-    entry_rel_base: u64,
-) -> Option<(usize, usize, MatchKind)> {
-    if pos + 3 > buf.len() {
-        return None;
-    }
-    let h = (roll_hash3(buf[pos], buf[pos + 1], buf[pos + 2]) as usize) & HASH_MASK;
+    h: usize,
+) -> Option<(usize, usize)> {
     let max_dist = 32768usize.min(pos);
-    let cur_rel = entry_rel_base.saturating_add(pos as u64);
-    let mut window_best: Option<(usize, usize)> = None;
+    let mut best: Option<(usize, usize)> = None;
     let mut chain = 0usize;
     let mut cur = head[h];
     while cur != NIL && chain < cfg.max_chain {
@@ -100,28 +101,18 @@ fn best_at(
             break;
         }
         let dist = pos - mp;
-        if dist == 0 || dist > 32768 || dist > max_dist {
+        if dist > max_dist {
             break;
         }
-        let mut len = 0usize;
-        while pos + len < buf.len()
-            && mp + len < pos
-            && buf[mp + len] == buf[pos + len]
-            && len < 258
-        {
-            len += 1;
-        }
+        let len = extend_match(buf, mp, pos);
         if len >= 3 {
             let score = match_score(len, dist);
-            let take = match window_best {
+            let take = match best {
                 None => true,
-                Some((bl, bd)) => {
-                    let old = match_score(bl, bd);
-                    score > old || (score == old && dist < bd)
-                }
+                Some((bl, bd)) => score > match_score(bl, bd),
             };
             if take {
-                window_best = Some((len, dist));
+                best = Some((len, dist));
             }
             if len >= cfg.nice_match {
                 break;
@@ -130,20 +121,10 @@ fn best_at(
         cur = prev[mp];
         chain += 1;
     }
-    let index_best = index.and_then(|ix| {
-        ix.scan_global(
-            entry,
-            cur_rel,
-            entry_rel_base,
-            buf,
-            pos,
-            max_dist.min(32768),
-            3,
-        )
-    });
-    pick_match(index_best, window_best)
+    best
 }
 
+#[inline(always)]
 fn insert_hash(buf: &[u8], pos: usize, head: &mut [u32], prev: &mut [u32]) {
     if pos + 3 > buf.len() {
         return;
@@ -163,47 +144,105 @@ pub fn compress_block(
     if buf.is_empty() || params.emit_start >= params.emit_end {
         return out;
     }
-    let mut head = vec![NIL; HASH_MASK + 1];
+
+    let emit_len = params.emit_end - params.emit_start;
+    // Better token reserve estimate: assume ~30% match rate for typical data.
+    // Literals: 1 token each, Matches: 1 token for ~10 bytes.
+    // Conservative estimate: 0.7 * emit_len + 0.3 * emit_len / 10
+    let est_tokens = (emit_len * 7 / 10) + (emit_len * 3 / 100);
+    out.tokens.reserve(est_tokens.max(64));
+
+    let mut head = vec![NIL; HASH_SIZE];
     let mut prev = vec![NIL; buf.len()];
-    let win = Window::new(buf, params.entry_rel_base);
-    let _ = win;
+    let _ = Window::new(buf, params.entry_rel_base);
+
+    // Populate the hash table for the overlap region so that positions in
+    // the emit window can find back-references into the overlap.
+    // We walk forward from 0 to emit_start, inserting each position.
+    let overlap_end = params.emit_start;
+    let mut i = 0usize;
+    while i < overlap_end {
+        insert_hash(buf, i, &mut head, &mut prev);
+        i += 1;
+    }
+
     let mut pos = params.emit_start;
     while pos < params.emit_end {
-        let m0 = best_at(
-            buf,
-            pos,
-            &head,
-            &prev,
-            cfg,
-            index,
-            params.entry,
-            params.entry_rel_base,
-        );
-        let m1 = if pos + 1 < params.emit_end {
-            best_at(
-                buf,
-                pos + 1,
-                &head,
-                &prev,
-                cfg,
-                index,
-                params.entry,
-                params.entry_rel_base,
-            )
-        } else {
+        if pos + 3 > buf.len() {
+            // Tail: emit remaining bytes as literals.
+            while pos < params.emit_end {
+                out.tokens.push(Lz77Token::Literal(buf[pos]));
+                pos += 1;
+            }
+            break;
+        }
+
+        let h = (roll_hash3(buf[pos], buf[pos + 1], buf[pos + 2]) as usize) & HASH_MASK;
+
+        // Window match.
+        let wm = window_best(buf, pos, &head, &prev, cfg, h);
+
+        // Index match (cross-entry). Only query if window match is weak.
+        let cur_rel = params.entry_rel_base.saturating_add(pos as u64);
+        let max_dist = 32768usize.min(pos);
+
+        // Skip index query if we already have a nice_match from the window.
+        let skip_index = wm.map(|(l, _)| l >= cfg.nice_match).unwrap_or(false);
+        let im = if skip_index {
             None
+        } else {
+            index.and_then(|ix| {
+                ix.scan_global(
+                    params.entry,
+                    cur_rel,
+                    params.entry_rel_base,
+                    buf,
+                    pos,
+                    max_dist,
+                    3,
+                )
+            })
         };
-        let use_literal_lazy = match (&m0, &m1) {
-            (Some((l0, _, _)), Some((l1, _, _))) => *l1 > *l0,
-            _ => false,
+
+        // Pick the better candidate.
+        let best = match (wm, im) {
+            (None, None) => None,
+            (Some(w), None) => Some((w, MatchKind::Window)),
+            (None, Some(i)) => Some((i, MatchKind::Index)),
+            (Some(w), Some(i)) => {
+                if match_score(i.0, i.1) >= match_score(w.0, w.1) {
+                    Some((i, MatchKind::Index))
+                } else {
+                    Some((w, MatchKind::Window))
+                }
+            }
         };
-        if use_literal_lazy {
+
+        // Lazy matching: only check pos+1 if current match is below nice_match
+        // and the current match is short (< 8 bytes). This avoids the overhead
+        // of a second hash lookup for long matches.
+        let use_literal = if let Some(((len0, _), _)) = best {
+            if len0 < cfg.nice_match && len0 < 8 && pos + 1 < params.emit_end && pos + 4 <= buf.len() {
+                let h1 = (roll_hash3(buf[pos + 1], buf[pos + 2], buf[pos + 3]) as usize)
+                    & HASH_MASK;
+                let wm1 = window_best(buf, pos + 1, &head, &prev, cfg, h1);
+                let len1 = wm1.map(|(l, _)| l).unwrap_or(0);
+                len1 > len0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if use_literal {
             out.tokens.push(Lz77Token::Literal(buf[pos]));
             insert_hash(buf, pos, &mut head, &mut prev);
             pos += 1;
             continue;
         }
-        if let Some((len, dist, src)) = m0 {
+
+        if let Some(((len, dist), src)) = best {
             if len >= 3 && dist >= 1 && dist <= 32768 {
                 match src {
                     MatchKind::Window => {
@@ -217,16 +256,16 @@ pub fn compress_block(
                     length: len as u16,
                     distance: dist as u16,
                 });
+                // Insert hashes for all positions covered by the match.
                 let end = (pos + len).min(buf.len());
-                let mut q = pos;
-                while q < end {
+                for q in pos..end {
                     insert_hash(buf, q, &mut head, &mut prev);
-                    q += 1;
                 }
                 pos = end;
                 continue;
             }
         }
+
         out.tokens.push(Lz77Token::Literal(buf[pos]));
         insert_hash(buf, pos, &mut head, &mut prev);
         pos += 1;

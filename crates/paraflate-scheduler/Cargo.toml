@@ -8,3 +8,4 @@ rust-version.workspace = true
 [dependencies]
 paraflate-core = { path = "../paraflate-core" }
 crossbeam-channel.workspace = true
+parking_lot.workspace = true

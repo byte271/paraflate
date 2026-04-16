@@ -87,15 +87,17 @@ pub fn recommend_stored(
     if uncompressed == 0 {
         return true;
     }
+    // Files smaller than ~150 bytes are almost always larger after DEFLATE
+    // due to header overhead. Always store them.
+    if uncompressed < 150 {
+        return true;
+    }
     let ratio = match_proxy / (entropy + 0.25).max(0.25);
     let thr = match planning {
         PlanningAggression::Safe => 1.85,
         PlanningAggression::Balanced => 1.35,
         PlanningAggression::Aggressive => 0.95,
     };
-    if uncompressed < 96 && entropy > 6.5 {
-        return true;
-    }
     if uncompressed < 2048 && entropy > 7.2 && ratio < thr * 0.6 {
         return true;
     }

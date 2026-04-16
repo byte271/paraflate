@@ -127,7 +127,7 @@ pub fn build_entry_compress_hints(
     }
     let mc = (model.lz77_max_chain as f64 * ep.lz77_chain_mult)
         .round()
-        .clamp(32.0, 2048.0) as u32;
+        .clamp(16.0, 256.0) as u32;
     let nm = (model.lz77_nice_match as f64 * (0.82 + 0.18 * ep.match_strength_proxy.min(3.0) / 3.0))
         .round()
         .clamp(16.0, 258.0) as u32;

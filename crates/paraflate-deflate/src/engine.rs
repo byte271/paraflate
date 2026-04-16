@@ -184,36 +184,45 @@ impl DeflateEngine {
         })?;
         let mut parts: Vec<Lz77JobOutput> = outcome.results.into_values().collect();
         parts.sort_by_key(|p| p.block.0);
+
+        // Extract metadata needed for debug traces before consuming tokens.
+        let part_meta: Vec<(u64, u32, u32, u64, usize)> = parts
+            .iter()
+            .map(|p| (p.block.0, p.window_matches, p.index_matches, p.block.0, p.tokens.len()))
+            .collect();
+
         let blocks: Vec<Vec<Lz77Token>> = if parts.is_empty() {
             vec![Vec::new()]
         } else {
-            parts.iter().map(|p| p.tokens.clone()).collect()
+            // Move token vectors out instead of cloning — avoids a full
+            // allocation and copy of every token for every block.
+            parts.iter_mut().map(|p| std::mem::take(&mut p.tokens)).collect()
         };
         let opts = DeflateEncodeOptions {
             global_huffman: profile.global_huffman,
         };
         let compressed = encode_deflate_blocks(&blocks, profile.strategy, &opts)?;
         if let Some(dt) = debug_trace.as_ref() {
-            let n = parts.len();
+            let n = part_meta.len();
             let total_compressed = compressed.len() as u64;
-            let total_raw: u64 = parts
+            let total_raw: u64 = part_meta
                 .iter()
-                .filter_map(|p| {
+                .filter_map(|(bid, _, _, _, _)| {
                     plan.spans
                         .iter()
-                        .find(|s| s.block.0 == p.block.0)
+                        .find(|s| s.block.0 == *bid)
                         .map(|s| s.len)
                 })
                 .sum();
-            for (i, p) in parts.iter().enumerate() {
-                let span = plan.spans.iter().find(|s| s.block.0 == p.block.0);
+            for (i, (bid, win, idx, _, tokc)) in part_meta.iter().enumerate() {
+                let span = plan.spans.iter().find(|s| s.block.0 == *bid);
                 let raw = span.map(|s| s.len).unwrap_or(0);
                 let off = span.map(|s| s.offset).unwrap_or(0);
                 let cb = if profile.global_huffman && n > 1 && total_raw > 0 {
                     total_compressed.saturating_mul(raw) / total_raw
                 } else {
                     let seg = encode_one_deflate_block(
-                        &p.tokens,
+                        &blocks[i],
                         profile.strategy,
                         &opts,
                         i + 1 == n.max(1),
@@ -224,15 +233,15 @@ impl DeflateEngine {
                 if let Ok(mut g) = dt.lock() {
                     g.push(DeflateBlockDebugRecord {
                         entry_id: entry.id.0,
-                        block_id: p.block.0,
+                        block_id: *bid,
                         offset: off,
                         raw_span_bytes: raw,
                         compressed_bytes: cb,
-                        token_count: p.tokens.len(),
+                        token_count: *tokc,
                         predicted_ratio: hints.predicted_size_ratio,
                         actual_ratio: act,
-                        lz_matches_window: p.window_matches,
-                        lz_matches_index: p.index_matches,
+                        lz_matches_window: *win,
+                        lz_matches_index: *idx,
                         fallback_code: 0,
                     });
                 }

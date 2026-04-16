@@ -7,3 +7,4 @@ rust-version.workspace = true
 
 [dependencies]
 paraflate-index = { path = "../paraflate-index" }
+crc32fast = "1.4"
